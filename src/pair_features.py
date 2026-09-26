@@ -31,6 +31,44 @@ JSON_LIST_COLUMNS = {
     "name_char_ngrams",
     "address_char_ngrams",
 }
+BASELINE_FEATURE_NAMES = (
+    "name_exact",
+    "name_ratio",
+    "name_token_set_ratio",
+    "name_token_sort_ratio",
+    "name_jaccard",
+    "name_overlap",
+    "name_char_ngram_jaccard",
+    "name_tfidf_cosine",
+    "address_exact",
+    "address_ratio",
+    "address_token_set_ratio",
+    "address_token_sort_ratio",
+    "address_jaccard",
+    "address_overlap",
+    "address_char_ngram_jaccard",
+    "address_tfidf_cosine",
+    "country_exact",
+    "country_nonempty_both",
+    "name_length_ratio",
+    "address_length_ratio",
+)
+EXPERIMENTAL_FEATURE_NAMES = (
+    "name_partial_ratio",
+    "name_token_containment_s1",
+    "name_token_containment_candidate",
+    "address_partial_ratio",
+    "address_token_containment_s1",
+    "address_token_containment_candidate",
+    "address_numeric_jaccard",
+    "address_numeric_overlap",
+    "country_missing_either",
+    "country_both_missing",
+    "name_address_ratio_product",
+    "name_address_tfidf_product",
+    "name_address_ratio_min",
+    "name_address_both_high",
+)
 REQUIRED_RECORD_COLUMNS = {ID_COL, "name_norm", "address_norm", "country_norm"}
 REQUIRED_CANDIDATE_COLUMNS = {SOURCE1_ID, CANDIDATE_ID}
 REQUIRED_TRUTH_COLUMNS = {SOURCE1_ID, "matched_entity_ids"}
@@ -132,6 +170,27 @@ def _token_sort_ratio(a: str, b: str) -> float:
     return fuzz.token_sort_ratio(a, b) / 100.0
 
 
+def _partial_ratio(a: str, b: str) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return fuzz.partial_ratio(a, b) / 100.0
+
+
+def _directional_containment(left: Iterable[str], right: Iterable[str]) -> float:
+    left_set, right_set = set(left), set(right)
+    if not left_set and not right_set:
+        return 1.0
+    if not left_set:
+        return 0.0
+    return len(left_set & right_set) / len(left_set)
+
+
+def _numeric_tokens(tokens: Iterable[str]) -> set[str]:
+    return {token for token in tokens if any(character.isdigit() for character in str(token))}
+
+
 def _length_ratio(a: str, b: str) -> float:
     if not a and not b:
         return 1.0
@@ -186,7 +245,15 @@ class TfidfViews:
 class PairFeatureGenerator:
     """Generate pairwise name, address, and country comparison features."""
 
-    def __init__(self, *, analyzer: str = "char", ngram_range=(3, 5), min_df=1):
+    def __init__(
+        self,
+        *,
+        analyzer: str = "char",
+        ngram_range=(3, 5),
+        min_df=1,
+        include_experimental: bool = False,
+    ):
+        self.include_experimental = bool(include_experimental)
         self.vectorizer_name = TfidfVectorizer(
             analyzer=analyzer,
             ngram_range=ngram_range,
@@ -234,28 +301,10 @@ class PairFeatureGenerator:
 
     @property
     def feature_names(self) -> list[str]:
-        return [
-            "name_exact",
-            "name_ratio",
-            "name_token_set_ratio",
-            "name_token_sort_ratio",
-            "name_jaccard",
-            "name_overlap",
-            "name_char_ngram_jaccard",
-            "name_tfidf_cosine",
-            "address_exact",
-            "address_ratio",
-            "address_token_set_ratio",
-            "address_token_sort_ratio",
-            "address_jaccard",
-            "address_overlap",
-            "address_char_ngram_jaccard",
-            "address_tfidf_cosine",
-            "country_exact",
-            "country_nonempty_both",
-            "name_length_ratio",
-            "address_length_ratio",
-        ]
+        names = list(BASELINE_FEATURE_NAMES)
+        if self.include_experimental:
+            names.extend(EXPERIMENTAL_FEATURE_NAMES)
+        return names
 
     def _tfidf_sim(
         self,
@@ -284,19 +333,29 @@ class PairFeatureGenerator:
         address_ngrams_a, address_ngrams_b = a["address_char_ngrams"], b["address_char_ngrams"]
         a_id, b_id = _as_text(a[ID_COL]), _as_text(b[ID_COL])
 
-        return {
+        name_tfidf = self._tfidf_sim(self._name_matrix, a_id, b_id, name_a, name_b)
+        address_tfidf = self._tfidf_sim(
+            self._address_matrix, a_id, b_id, address_a, address_b
+        )
+        name_ratio = _ratio(name_a, name_b)
+        address_ratio = _ratio(address_a, address_b)
+        name_tokens_a = set(name_tokens_a)
+        name_tokens_b = set(name_tokens_b)
+        address_tokens_a = set(address_tokens_a)
+        address_tokens_b = set(address_tokens_b)
+        numeric_a = _numeric_tokens(address_tokens_a)
+        numeric_b = _numeric_tokens(address_tokens_b)
+        features = {
             "name_exact": float(bool(name_a) and name_a == name_b),
-            "name_ratio": _ratio(name_a, name_b),
+            "name_ratio": name_ratio,
             "name_token_set_ratio": _token_set_ratio(name_a, name_b),
             "name_token_sort_ratio": _token_sort_ratio(name_a, name_b),
             "name_jaccard": _set_jaccard(name_tokens_a, name_tokens_b),
             "name_overlap": _overlap_coefficient(name_tokens_a, name_tokens_b),
             "name_char_ngram_jaccard": _set_jaccard(name_ngrams_a, name_ngrams_b),
-            "name_tfidf_cosine": self._tfidf_sim(
-                self._name_matrix, a_id, b_id, name_a, name_b
-            ),
+            "name_tfidf_cosine": name_tfidf,
             "address_exact": float(bool(address_a) and address_a == address_b),
-            "address_ratio": _ratio(address_a, address_b),
+            "address_ratio": address_ratio,
             "address_token_set_ratio": _token_set_ratio(address_a, address_b),
             "address_token_sort_ratio": _token_sort_ratio(address_a, address_b),
             "address_jaccard": _set_jaccard(address_tokens_a, address_tokens_b),
@@ -304,14 +363,40 @@ class PairFeatureGenerator:
             "address_char_ngram_jaccard": _set_jaccard(
                 address_ngrams_a, address_ngrams_b
             ),
-            "address_tfidf_cosine": self._tfidf_sim(
-                self._address_matrix, a_id, b_id, address_a, address_b
-            ),
+            "address_tfidf_cosine": address_tfidf,
             "country_exact": float(bool(country_a) and country_a == country_b),
             "country_nonempty_both": float(bool(country_a) and bool(country_b)),
             "name_length_ratio": _length_ratio(name_a, name_b),
             "address_length_ratio": _length_ratio(address_a, address_b),
         }
+        if self.include_experimental:
+            features.update(
+                {
+                    "name_partial_ratio": _partial_ratio(name_a, name_b),
+                    "name_token_containment_s1": _directional_containment(
+                        name_tokens_a, name_tokens_b
+                    ),
+                    "name_token_containment_candidate": _directional_containment(
+                        name_tokens_b, name_tokens_a
+                    ),
+                    "address_partial_ratio": _partial_ratio(address_a, address_b),
+                    "address_token_containment_s1": _directional_containment(
+                        address_tokens_a, address_tokens_b
+                    ),
+                    "address_token_containment_candidate": _directional_containment(
+                        address_tokens_b, address_tokens_a
+                    ),
+                    "address_numeric_jaccard": _set_jaccard(numeric_a, numeric_b),
+                    "address_numeric_overlap": _overlap_coefficient(numeric_a, numeric_b),
+                    "country_missing_either": float(not (country_a and country_b)),
+                    "country_both_missing": float(not country_a and not country_b),
+                    "name_address_ratio_product": name_ratio * address_ratio,
+                    "name_address_tfidf_product": name_tfidf * address_tfidf,
+                    "name_address_ratio_min": min(name_ratio, address_ratio),
+                    "name_address_both_high": float(name_ratio >= 0.8 and address_ratio >= 0.8),
+                }
+            )
+        return features
 
     def transform(self, candidates: pd.DataFrame) -> pd.DataFrame:
         """Transform externally generated ``source1_entity_id,candidate_entity_id`` pairs."""
