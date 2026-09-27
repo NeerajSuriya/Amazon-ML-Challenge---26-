@@ -8,8 +8,8 @@ the 20-feature schema.
 
 The integration script trains the frozen matcher on labeled blocked candidates,
 then scores a separate (or explicitly identical) processed source set. All
-paths are required; the repository does not contain an authoritative full-data
-path or competition submission schema.
+processed-input paths are required. The challenge aggregate schema is provided
+below; no authoritative full-data paths are assumed.
 
 ```bash
 myenv/bin/python scripts/run_production_inference.py \
@@ -86,10 +86,23 @@ match_probability
 ```
 
 `--matches-output` contains the same columns, filtered to rows whose
-probability meets the selected threshold. These are local integration
-artifacts. The repository does not document an official competition
-`matching_results.tsv` or submission schema, so the thresholded file must not
-be treated as that schema without an external specification.
+probability meets the selected threshold. These remain useful pair-level local
+integration artifacts.
+
+For the challenge output contract, pass the optional
+`--candidate-submission-output` and `--matching-submission-output` arguments.
+They aggregate the exact candidate and thresholded-match rows used by the
+matcher into one row per S1, including empty lists:
+
+```text
+source1_entity_id    candidate_entity_ids
+source1_entity_id    matched_entity_ids
+```
+
+The raw-to-final convenience command in
+`scripts/run_submission_pipeline.py` performs preprocessing first and writes
+these two files as `output/candidate_pairs.tsv` and
+`output/matching_results.tsv`. Validate them with `utils/validate_submission.py`.
 
 The script prints QA counts for training candidates, feature rows, inference
 candidates, matcher outputs, selected matches, threshold, and output schemas.
