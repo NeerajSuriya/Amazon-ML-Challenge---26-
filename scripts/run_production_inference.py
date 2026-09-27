@@ -37,6 +37,10 @@ from src.pair_features import (  # noqa: E402
     PairFeatureGenerator,
     attach_ground_truth_labels,
 )
+from src.submission import (  # noqa: E402
+    aggregate_candidate_pairs,
+    aggregate_matches,
+)
 
 PROCESSED_REQUIRED_COLUMNS = (
     "entity_id",
@@ -191,11 +195,24 @@ def run_pipeline(
     matches_output: Path,
     threshold: float = MATCH_THRESHOLD,
     random_state: int = 42,
+    candidate_submission_output: Path | None = None,
+    matching_submission_output: Path | None = None,
+    inference_chunk_size: int | None = 100_000,
 ) -> dict[str, object]:
-    """Fit the frozen matcher and write scored/thresholded candidate outputs."""
+    """Fit the frozen matcher and write pair and optional submission outputs.
+
+    The optional aggregate outputs are built from the exact inference candidate
+    frame and thresholded matcher rows used in this call.  They are not
+    regenerated from a separate candidate file.
+    """
     if not 0.0 <= float(threshold) <= 1.0:
         raise ValueError("threshold must be between 0 and 1")
     threshold = float(threshold)
+    if inference_chunk_size is not None and int(inference_chunk_size) < 1:
+        raise ValueError("inference_chunk_size must be positive or None")
+    inference_chunk_size = (
+        None if inference_chunk_size is None else int(inference_chunk_size)
+    )
 
     training_frames = (train_source1, train_source2, train_source3)
     inference_frames = (inference_source1, inference_source2, inference_source3)
@@ -243,22 +260,45 @@ def run_pipeline(
     matcher = ProductionMatcher(random_state=random_state)
     matcher.fit(training_features)
 
-    inference_features = generator.transform(inference_candidates)
-    _validate_feature_frame(
-        inference_features,
-        generator.feature_names,
-        inference_candidates,
-        "inference features",
-    )
-    if inference_features.empty:
-        scored = pd.DataFrame(columns=OUTPUT_COLUMNS)
-    else:
-        scored = matcher.predict_dataframe(inference_features)
-    if list(scored.columns) != OUTPUT_COLUMNS:
-        raise ValueError(
-            f"matcher output schema mismatch: expected {OUTPUT_COLUMNS}, "
-            f"got {list(scored.columns)}"
+    scored_chunks = []
+    chunk_size = inference_chunk_size or max(len(inference_candidates), 1)
+    for start in range(0, len(inference_candidates), chunk_size):
+        candidate_chunk = inference_candidates.iloc[start : start + chunk_size].reset_index(drop=True)
+        feature_chunk = generator.transform(candidate_chunk)
+        _validate_feature_frame(
+            feature_chunk,
+            generator.feature_names,
+            candidate_chunk,
+            "inference features",
         )
+        if feature_chunk.empty:
+            continue
+        scored_chunk = matcher.predict_dataframe(feature_chunk)
+        if list(scored_chunk.columns) != OUTPUT_COLUMNS:
+            raise ValueError(
+                f"matcher output schema mismatch: expected {OUTPUT_COLUMNS}, "
+                f"got {list(scored_chunk.columns)}"
+            )
+        if len(scored_chunk) != len(candidate_chunk):
+            raise ValueError(
+                f"matcher output row count mismatch: {len(scored_chunk)} outputs vs "
+                f"{len(candidate_chunk)} candidates"
+            )
+        if _identity_tuples(scored_chunk) != _identity_tuples(candidate_chunk):
+            raise ValueError("matcher output candidate identity row order changed")
+        probabilities = scored_chunk["match_probability"].to_numpy(dtype=float)
+        if probabilities.size and (
+            not np.isfinite(probabilities).all()
+            or (probabilities < 0.0).any()
+            or (probabilities > 1.0).any()
+        ):
+            raise ValueError("matcher returned a probability outside the finite [0, 1] range")
+        scored_chunks.append(scored_chunk.loc[:, OUTPUT_COLUMNS])
+
+    if scored_chunks:
+        scored = pd.concat(scored_chunks, ignore_index=True)
+    else:
+        scored = pd.DataFrame(columns=OUTPUT_COLUMNS)
     if len(scored) != len(inference_candidates):
         raise ValueError(
             f"matcher output row count mismatch: {len(scored)} outputs vs "
@@ -266,32 +306,61 @@ def run_pipeline(
         )
     if _identity_tuples(scored) != _identity_tuples(inference_candidates):
         raise ValueError("matcher output candidate identity row order changed")
-    probabilities = scored["match_probability"].to_numpy(dtype=float)
-    if probabilities.size and (
-        not np.isfinite(probabilities).all()
-        or (probabilities < 0.0).any()
-        or (probabilities > 1.0).any()
-    ):
-        raise ValueError("matcher returned a probability outside the finite [0, 1] range")
 
-    scored = scored.loc[:, OUTPUT_COLUMNS].copy()
     matches = scored.loc[scored["match_probability"] >= threshold].copy().reset_index(drop=True)
     _write_output(scored, scored_output)
     _write_output(matches, matches_output)
 
+    if candidate_submission_output is not None:
+        candidate_output = aggregate_candidate_pairs(
+            inference_candidates,
+            inference_source1["entity_id"].tolist(),
+            source2_ids=inference_source2["entity_id"].tolist(),
+            source3_ids=inference_source3["entity_id"].tolist(),
+        )
+        _write_output(candidate_output, candidate_submission_output)
+    if matching_submission_output is not None:
+        matching_output = aggregate_matches(
+            matches,
+            inference_source1["entity_id"].tolist(),
+            candidate_pairs=inference_candidates,
+            source2_ids=inference_source2["entity_id"].tolist(),
+            source3_ids=inference_source3["entity_id"].tolist(),
+        )
+        _write_output(matching_output, matching_submission_output)
+
+    candidate_counts = (
+        inference_candidates.groupby(SOURCE1_ID).size()
+        if not inference_candidates.empty
+        else pd.Series(dtype=int)
+    )
+    match_counts = matches.groupby(SOURCE1_ID).size() if not matches.empty else pd.Series(dtype=int)
+    inference_s1_count = int(len(inference_source1))
     return {
         "training_candidate_count": int(len(training_candidates)),
         "training_feature_rows": int(len(training_features)),
         "training_feature_columns": int(len(FEATURE_COLUMNS)),
+        "inference_s1_count": inference_s1_count,
         "inference_candidate_count": int(len(inference_candidates)),
-        "inference_feature_rows": int(len(inference_features)),
+        "inference_feature_rows": int(len(inference_candidates)),
+        "inference_candidate_s1_zero_count": int(inference_s1_count - len(candidate_counts.index)),
         "matcher_output_count": int(len(scored)),
         "predicted_match_count": int(len(matches)),
+        "predicted_s1_zero_count": int(inference_s1_count - len(match_counts.index)),
+        "predicted_s1_one_count": int((match_counts == 1).sum()),
+        "predicted_s1_multiple_count": int((match_counts > 1).sum()),
         "threshold": threshold,
+        "inference_chunk_size": inference_chunk_size,
         "scored_schema": list(scored.columns),
         "matches_schema": list(matches.columns),
         "scored_output": str(scored_output),
         "matches_output": str(matches_output),
+        "candidate_submission_output": (
+            None if candidate_submission_output is None else str(candidate_submission_output)
+        ),
+        "matching_submission_output": (
+            None if matching_submission_output is None else str(matching_submission_output)
+        ),
     }
 
 
@@ -308,8 +377,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ground-truth", type=Path, required=True)
     parser.add_argument("--scored-output", type=Path, required=True)
     parser.add_argument("--matches-output", type=Path, required=True)
+    parser.add_argument(
+        "--candidate-submission-output",
+        type=Path,
+        help="Optional aggregated candidate_pairs.tsv output",
+    )
+    parser.add_argument(
+        "--matching-submission-output",
+        type=Path,
+        help="Optional aggregated matching_results.tsv output",
+    )
     parser.add_argument("--threshold", type=float, default=MATCH_THRESHOLD)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument("--inference-chunk-size", type=int, default=100_000)
     return parser
 
 
@@ -341,6 +421,9 @@ def main() -> None:
         matches_output=args.matches_output,
         threshold=args.threshold,
         random_state=args.random_state,
+        candidate_submission_output=args.candidate_submission_output,
+        matching_submission_output=args.matching_submission_output,
+        inference_chunk_size=args.inference_chunk_size,
     )
     print("Production matcher integration QA")
     for key, value in summary.items():
